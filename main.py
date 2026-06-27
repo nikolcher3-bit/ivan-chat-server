@@ -33,6 +33,7 @@ import os
 import re
 import time
 import random
+import base64
 import sqlite3
 import asyncio
 import hashlib
@@ -41,7 +42,7 @@ from contextlib import closing
 from typing import Optional
 
 import httpx
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -54,6 +55,12 @@ GEMINI_MODEL    = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_URL      = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 CHAT_SEP        = "~"            # разделитель участников в chat_id личного чата (в username запрещён)
 TCK_INTERVAL_MS = 30_000        # ТЦК нагнетает не чаще раза в 30 секунд
+
+# Загрузка файлов (голосовые и т.п.)
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(8 * 1024 * 1024)))  # 8 МБ по умолчанию
+# Внешний адрес сервиса для построения ссылок на файлы.
+# На Render автоматически доступна переменная RENDER_EXTERNAL_URL.
+PUBLIC_BASE_URL  = (os.environ.get("PUBLIC_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
 
 SYSTEM_USERS = {
     "ai":  {"display_name": "Ассистент (ИИ)", "status": "Google Gemini"},
@@ -160,13 +167,28 @@ def init_db() -> None:
                 sender_username  TEXT    NOT NULL,
                 text             TEXT    NOT NULL,
                 timestamp        INTEGER NOT NULL,   -- epoch миллисекунды
-                is_read          INTEGER NOT NULL DEFAULT 0
+                is_read          INTEGER NOT NULL DEFAULT 0,
+                audio_url        TEXT    NOT NULL DEFAULT ''   -- ссылка на голосовое/вложение
+            );
+
+            -- Хранилище загруженных файлов (голосовые и пр.).
+            -- ВНИМАНИЕ: на бесплатном Render диск эфемерный — содержимое
+            -- пропадает при перезапуске/засыпании. Для продакшена см. комментарии.
+            CREATE TABLE IF NOT EXISTS uploads (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                mime        TEXT    NOT NULL,
+                data        BLOB    NOT NULL,
+                created_at  INTEGER NOT NULL
             );
 
             CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id, id);
             CREATE INDEX IF NOT EXISTS idx_members_user  ON room_members(username);
             """
         )
+        # --- мини-миграция: добавить audio_url, если БД создана старой версией ---
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
+        if "audio_url" not in cols:
+            conn.execute("ALTER TABLE messages ADD COLUMN audio_url TEXT NOT NULL DEFAULT ''")
     # Системные боты (войти под ними нельзя — пароль невалидный).
     for uname, info in SYSTEM_USERS.items():
         with closing(db()) as conn, conn:
@@ -270,21 +292,23 @@ def room_entry(room: dict) -> dict:
 
 
 # ---- сообщения ----
-def save_message(chat_id: str, sender: str, text: str) -> dict:
+def save_message(chat_id: str, sender: str, text: str, audio_url: str = "") -> dict:
     ts = int(time.time() * 1000)
     with closing(db()) as conn, conn:
         cur = conn.execute(
-            "INSERT INTO messages (chat_id, sender_username, text, timestamp, is_read) VALUES (?, ?, ?, ?, 0)",
-            (chat_id, sender, text, ts),
+            "INSERT INTO messages (chat_id, sender_username, text, timestamp, is_read, audio_url) "
+            "VALUES (?, ?, ?, ?, 0, ?)",
+            (chat_id, sender, text, ts, audio_url),
         )
         mid = cur.lastrowid
-    return {"id": mid, "chat_id": chat_id, "sender": sender, "text": text, "timestamp": ts, "is_read": 0}
+    return {"id": mid, "chat_id": chat_id, "sender": sender, "text": text,
+            "timestamp": ts, "is_read": 0, "audio_url": audio_url}
 
 
 def fetch_messages(chat_id: str) -> list:
     with closing(db()) as conn:
         rows = conn.execute(
-            "SELECT id, chat_id, sender_username AS sender, text, timestamp, is_read "
+            "SELECT id, chat_id, sender_username AS sender, text, timestamp, is_read, audio_url "
             "FROM messages WHERE chat_id = ? ORDER BY id ASC",
             (chat_id,),
         ).fetchall()
@@ -333,6 +357,12 @@ class MessageIn(BaseModel):
     chat_id: str
     sender_username: str
     text: str
+    audio_url: Optional[str] = None     # ссылка на голосовое (получена из /api/upload)
+
+
+class UploadIn(BaseModel):
+    kind: Optional[str] = None          # напр. "audio"
+    data: str                           # data-URL: "data:audio/webm;base64,...."
 
 
 class ReadIn(BaseModel):
@@ -516,15 +546,17 @@ def get_messages(chat_id: str):
 
 @app.post("/api/messages")
 def post_message(data: MessageIn, background: BackgroundTasks):
-    sender  = clean_username(data.sender_username)
-    text    = (data.text or "").strip()[:4000]
-    chat_id = (data.chat_id or "").strip()
-    if not sender or not text:
+    sender    = clean_username(data.sender_username)
+    text      = (data.text or "").strip()[:4000]
+    chat_id   = (data.chat_id or "").strip()
+    audio_url = (data.audio_url or "").strip()[:500]
+    # сообщение валидно, если есть отправитель и хотя бы текст ИЛИ голосовое
+    if not sender or (not text and not audio_url):
         raise HTTPException(400, "Пустое сообщение или некорректный отправитель.")
 
     if CHAT_SEP in chat_id:
         # ---- личный чат ----
-        msg = save_message(chat_id, sender, text)
+        msg = save_message(chat_id, sender, text, audio_url)
         parts = chat_participants(chat_id)
         if "ai" in parts and sender != "ai":
             background.add_task(handle_ai_reply, chat_id)
@@ -540,7 +572,7 @@ def post_message(data: MessageIn, background: BackgroundTasks):
         raise HTTPException(403, "Вы не участник этого чата.")
     if room["type"] == "channel" and sender != room["creator_username"]:
         raise HTTPException(403, "Только администраторы могут писать в этот канал")
-    return save_message(chat_id, sender, text)
+    return save_message(chat_id, sender, text, audio_url)
 
 
 @app.post("/api/messages/{chat_id}/read")
@@ -554,6 +586,74 @@ def mark_read(chat_id: str, data: ReadIn):
             (chat_id, me),
         )
     return {"ok": True}
+
+
+# ------------------------------------------------------------------ #
+# 6b. ЗАГРУЗКА ФАЙЛОВ (голосовые сообщения)                           #
+# ------------------------------------------------------------------ #
+def public_base(request: Request) -> str:
+    """Внешний https-адрес сервиса для построения ссылок на файлы."""
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL
+    base = str(request.base_url).rstrip("/")
+    # за обратным прокси (Render) принудительно используем https, кроме локалки
+    if base.startswith("http://") and "localhost" not in base and "127.0.0.1" not in base:
+        base = "https://" + base[len("http://"):]
+    return base
+
+
+def parse_data_url(raw: str):
+    """Разбирает data-URL → (mime, bytes). Принимает и «голый» base64."""
+    raw = (raw or "").strip()
+    mime = "application/octet-stream"
+    b64 = raw
+    if raw.startswith("data:"):
+        header, _, b64 = raw.partition(",")
+        m = re.match(r"data:([^;,]+)", header)
+        if m:
+            mime = m.group(1)
+    try:
+        blob = base64.b64decode(b64, validate=False)
+    except Exception:
+        raise HTTPException(400, "Некорректные данные файла.")
+    return mime, blob
+
+
+@app.post("/api/upload")
+def upload_file(data: UploadIn, request: Request):
+    """
+    Принимает аудио (data-URL в JSON), сохраняет в БД и возвращает {"url", "id"}.
+    Клиент кладёт этот url в поле audio_url сообщения.
+    """
+    mime, blob = parse_data_url(data.data)
+    if not blob:
+        raise HTTPException(400, "Пустой файл.")
+    if len(blob) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"Файл слишком большой (> {MAX_UPLOAD_BYTES // (1024 * 1024)} МБ).")
+    # на всякий случай ограничим тип голосовыми/аудио, но не строго
+    if not (mime.startswith("audio/") or mime.startswith("image/")):
+        mime = "audio/webm"
+    with closing(db()) as conn, conn:
+        cur = conn.execute(
+            "INSERT INTO uploads (mime, data, created_at) VALUES (?, ?, ?)",
+            (mime, blob, int(time.time() * 1000)),
+        )
+        fid = cur.lastrowid
+    return {"id": fid, "url": f"{public_base(request)}/api/file/{fid}"}
+
+
+@app.get("/api/file/{file_id}")
+def get_file(file_id: int):
+    """Отдаёт ранее загруженный файл по id."""
+    with closing(db()) as conn:
+        row = conn.execute("SELECT mime, data FROM uploads WHERE id = ?", (file_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Файл не найден.")
+    return Response(
+        content=bytes(row["data"]),
+        media_type=row["mime"],
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
 
 
 # ------------------------------------------------------------------ #
